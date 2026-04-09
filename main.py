@@ -1,96 +1,160 @@
 import asyncio
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
-import uvicorn
+import json
+from fastapi import FastAPI, BackgroundTasks, Request
+from sse_starlette.sse import EventSourceResponse
+import redis.asyncio as redis
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-app = FastAPI()
+# ==========================================
+# 1. 환경 변수 및 설정 관리
+# ==========================================
+class Settings(BaseSettings):
+    redis_host: str
+    redis_port: int
+    redis_db: int
+    redis_password: str | None = None
 
-# 1. 시스템 메모리 상태 저장소 (Stateful)
-# LLM 파이프라인으로 들어가는 '원자성이 보장된 단일 작업 대기열'
-task_queue = asyncio.Queue() 
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
-# 형태: { "video_id": [user_session_queue1, user_session_queue2, ...] }
-# 여러 사용자의 SSE 커넥션을 video_id로 묶어서 관리하는 매핑 테이블
-active_sessions = {}
+settings = Settings()
 
-@app.on_event("startup")
-async def startup_event():
-    # 서버 시작 시 무한 루프로 돌아가는 가상의 LLM 워커를 백그라운드에 띄움
-    asyncio.create_task(llm_worker())
+# ==========================================
+# 2. 애플리케이션 및 인프라 초기화
+# ==========================================
+app = FastAPI(title="Video Credibility Assessment API")
 
-async def llm_worker():
-    """Service Bus와 LLM 파이프라인을 대체하는 백그라운드 워커"""
-    while True:
-        # 작업 큐에서 video_id를 하나 꺼냄 (대기)
-        video_id = await task_queue.get()
+redis_client = redis.Redis(
+    host=settings.redis_host,
+    port=settings.redis_port,
+    db=settings.redis_db,
+    password=settings.redis_password,
+    decode_responses=True
+)
+
+# SSE Connection 상태 관리 (인메모리)
+# 구조: { "video_id": [asyncio.Queue(), asyncio.Queue(), ...] }
+active_connections = {}
+
+
+# ==========================================
+# 3. 외부 시스템 연동 모의 (Mock) 함수
+# ==========================================
+async def check_existing_report_in_db(video_id: str):
+    """(다이어그램 4, 5-Y) 기존 분석 이력 조회"""
+    # 실제 구현 시 SQL DB 질의 로직 포함
+    return None 
+
+async def save_report_to_db(video_id: str, data: dict):
+    """(다이어그램 13, 14) 분석 결과 적재"""
+    # 실제 구현 시 SQL DB 및 Blob Storage 저장 로직 포함
+    print(f"[DB/Blob 적재 완료] {video_id}: {data}")
+
+
+# ==========================================
+# 4. 코어 비즈니스 로직 (파이프라인)
+# ==========================================
+async def notify_clients(video_id: str, message: dict):
+    """이벤트 발생 시 대기 중인 큐로 메시지 푸시"""
+    if video_id in active_connections:
+        for queue in active_connections[video_id]:
+            await queue.put(message)
+
+async def process_video_pipeline(video_id: str):
+    """(다이어그램 8 ~ 15) ETL 및 LLM 분석 비동기 워크플로우"""
+    try:
+        print(f"[{video_id}] 파이프라인 시작 (자막 추출 및 Databricks 전처리)...")
+        await asyncio.sleep(2) # 네트워크 지연 모의
         
-        print(f"[LLM Worker] '{video_id}' 연산 시작 (단 한 번만 실행됨)...")
-        await asyncio.sleep(10)  # 무거운 LLM 처리를 가정 (5초 소요)
-        print(f"[LLM Worker] '{video_id}' 연산 완료!")
+        # 1차 즉각 필터링 (다이어그램 11, 12-B)
+        is_fake_fast_check = False 
+        if is_fake_fast_check:
+            print(f"[{video_id}] 명백한 허위 감지 -> Block 전송")
+            await notify_clients(video_id, {"event": "block", "data": json.dumps({"reason": "Scam Video Detected"})})
+            return
+
+        print(f"[{video_id}] 세부 LLM 신뢰도 평가 진행 중...")
+        await asyncio.sleep(3) # LLM 추론 시간 모의
         
-        # 완료 결과를 JSON 스트링 형태(SSE 규격)로 포매팅
-        result_message = f"data: {{\"video_id\": \"{video_id}\", \"status\": \"COMPLETED\", \"score\": 95}}\n\n"
+        report_data = {
+            "video_id": video_id,
+            "score": 85,
+            "status": "Trustworthy content",
+            "details": "The video provides verifiable sources."
+        }
         
-        # 해당 video_id를 대기 중인 모든 사용자 세션(큐)에 결과 브로드캐스트
-        if video_id in active_sessions:
-            for user_queue in active_sessions[video_id]:
-                await user_queue.put(result_message)
-            
-            # [매우 중요] 완료 후 메모리 해제(상태 초기화)
-            del active_sessions[video_id]
-            
-        task_queue.task_done()
+        # 결과 영구 저장 및 클라이언트 브로드캐스트 (다이어그램 14)
+        await save_report_to_db(video_id, report_data)
+        print(f"[{video_id}] 분석 완료 -> 클라이언트 Push")
+        await notify_clients(video_id, {"event": "complete", "data": json.dumps(report_data)})
+
+    except Exception as e:
+        print(f"[{video_id}] 파이프라인 에러: {e}")
+        await notify_clients(video_id, {"event": "error", "data": json.dumps({"error": str(e)})})
+        
+    finally:
+        # 종료 시 대기열 락 해제 (다이어그램 15)
+        lock_key = f"lock:video_process:{video_id}"
+        await redis_client.delete(lock_key)
+        print(f"[{video_id}] 자원 정리 및 락 해제 완료")
+
+
+# ==========================================
+# 5. API 엔드포인트
+# ==========================================
+@app.post("/api/scripts/{video_id}")
+async def trigger_video_analysis(video_id: str, background_tasks: BackgroundTasks):
+    """(다이어그램 6, 7) 영상 분석 트리거 및 중복 방지 (Redis SETNX)"""
+    lock_key = f"lock:video_process:{video_id}"
+    
+    # TTL 10분 설정: 시스템 비정상 종료 시 데드락 방지
+    lock_acquired = await redis_client.set(lock_key, "processing", nx=True, ex=600)
+    
+    if not lock_acquired:
+        return {"status": "processing_already_started", "video_id": video_id}
+
+    background_tasks.add_task(process_video_pipeline, video_id)
+    return {"status": "processing_started", "video_id": video_id}
+
 
 @app.get("/api/stream/{video_id}")
-async def stream_video_analysis(video_id: str, request: Request):
-    """
-    클라이언트가 익스텐션에서 호출하는 SSE 진입점
-    """
-    # 1. 이 접속자만을 위한 고유한 메시지 수신 큐 생성
-    user_queue = asyncio.Queue()
+async def stream_video_report(video_id: str, request: Request):
+    """(다이어그램 2, 3) SSE 스트림 연결 및 결과 수신"""
+    existing_report = await check_existing_report_in_db(video_id)
     
-    # 2. 원자성 보장 및 중복 확인 (FastAPI는 싱글 이벤트 루프라 이 블록 자체가 원자적임)
-    is_first_requester = False
-    if video_id not in active_sessions:
-        active_sessions[video_id] = []
-        is_first_requester = True
-        
-    # 3. video_id 그룹에 사용자 세션 연결(매핑)
-    active_sessions[video_id].append(user_queue)
-    
-    # 4. 첫 번째 요청인 경우에만 '작업 큐'에 등록
-    if is_first_requester:
-        await task_queue.put(video_id)
-        print(f"[API] 신규 요청: '{video_id}' 큐 등록 완료. 현재 대기자: 1명")
-    else:
-        print(f"[API] 중복 요청 방어: '{video_id}' 대기열에 탑승함. 현재 대기자: {len(active_sessions[video_id])}명")
-
-    # 5. 사용자에게 이벤트를 푸시하는 제너레이터 함수 (SSE)
     async def event_generator():
+        if existing_report:
+            # 즉시 반환 (Cache Hit)
+            yield {"event": "complete", "data": json.dumps(existing_report)}
+            return
+
+        # 커넥션 큐 등록
+        queue = asyncio.Queue()
+        if video_id not in active_connections:
+            active_connections[video_id] = []
+        active_connections[video_id].append(queue)
+
         try:
-            # 접속 성공 즉시 상태 전달
-            yield f"data: {{\"status\": \"CONNECTED\", \"video_id\": \"{video_id}\"}}\n\n"
-            
-            # LLM 워커가 결과를 넣어줄 때까지 무한 대기
             while True:
+                # 클라이언트 이탈 감지
                 if await request.is_disconnected():
-                    break # 클라이언트가 브라우저를 끄면 루프 탈출
+                    print(f"[{video_id}] 클라이언트 연결 종료")
+                    break
                 
                 try:
-                    # 1초마다 큐를 확인 (연결 끊김을 주기적으로 감지하기 위해 timeout 설정)
-                    message = await asyncio.wait_for(user_queue.get(), timeout=1.0)
+                    # 데이터 수신 대기 (10초 타임아웃)
+                    message = await asyncio.wait_for(queue.get(), timeout=10.0)
                     yield message
-                    break # 완료 메시지를 보냈으므로 스트림 정상 종료
+                    
+                    if message["event"] in ["complete", "block", "error"]:
+                        break
                 except asyncio.TimeoutError:
-                    continue # 데이터가 아직 없으면 계속 대기
+                    # 유휴 상태 타임아웃 방지용 Ping
+                    yield {"event": "ping", "data": "processing..."}
         finally:
-            # 예외가 발생하거나 연결이 끊어지면 안전하게 세션 제거 (메모리 누수 방지)
-            if video_id in active_sessions and user_queue in active_sessions[video_id]:
-                active_sessions[video_id].remove(user_queue)
-                if not active_sessions[video_id]: # 기다리는 사람이 아무도 없으면 방 폭파
-                    del active_sessions[video_id]
+            # 메모리 누수 방지 로직
+            if video_id in active_connections:
+                active_connections[video_id].remove(queue)
+                if not active_connections[video_id]:
+                    del active_connections[video_id]
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    return EventSourceResponse(event_generator())
