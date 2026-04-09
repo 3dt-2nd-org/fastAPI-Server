@@ -1,11 +1,11 @@
 import asyncio
 import json
-# 실제 Databricks API 호출 시 httpx 또는 aiohttp 사용 권장
-# import httpx 
-from fastapi import FastAPI, BackgroundTasks, Request
-from sse_starlette.sse import EventSourceResponse
 import redis.asyncio as redis
+
+from fastapi import FastAPI, Request
+from sse_starlette.sse import EventSourceResponse
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from databricks import sql
 
 # ==========================================
 # 1. 인프라 설정 및 초기화
@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     redis_db: int = 0
     redis_password: str | None = None
     
-    # Databricks 설정 (.env 매핑)
+    # Databricks 설정
     databricks_server_hostname: str
     databricks_http_path: str
     databricks_token: str
@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     databricks_schema: str
     
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+
 settings = Settings()
 app = FastAPI(title="Video Credibility Assessment API")
 
@@ -33,15 +34,69 @@ redis_client = redis.Redis(
     port=settings.redis_port,
     db=settings.redis_db,
     password=settings.redis_password,
+    ssl=True,
     decode_responses=True
 )
 
 # ==========================================
-# 2. 시스템 상태 및 DB 조회 모의 함수
+# 2. Databricks DB 조회 로직 (Cache Hit 검증)
 # ==========================================
-async def check_existing_report_in_db(video_id: str):
-    """기존 분석 리포트 캐시 조회"""
-    return None 
+def _sync_check_db(video_id: str) -> dict | None:
+    """
+    [동기 함수] video_analysis_summary 테이블에서 영상 단일 분석 결과를 조회합니다.
+    """
+    table_path = f"{settings.databricks_catalog}.{settings.databricks_schema}.video_analysis_summary"
+    
+    # 1. 파라미터 바인딩 기호를 %s 에서 :video_id 로 변경
+    query = f"""
+        SELECT 
+            video_id, 
+            title, 
+            channel_name, 
+            published_at, 
+            overall_trust_score, 
+            trust_level, 
+            overall_summary, 
+            analyzed_at 
+        FROM {table_path} 
+        WHERE video_id = :video_id 
+        LIMIT 1
+    """
+    
+    try:
+        with sql.connect(
+            server_hostname=settings.databricks_server_hostname,
+            http_path=settings.databricks_http_path,
+            access_token=settings.databricks_token
+        ) as connection:
+            with connection.cursor() as cursor:
+                # 2. 튜플 (video_id,) 대신 딕셔너리 형태로 파라미터 전달
+                cursor.execute(query, {"video_id": video_id})
+                row = cursor.fetchone()
+                
+                if row:
+                    print(f"[{video_id}] Databricks DB 캐시 히트: 요약 리포트 발견")
+                    
+                    return {
+                        "video_id": row.video_id,
+                        "title": row.title,
+                        "channel_name": row.channel_name,
+                        "published_at": row.published_at.isoformat() if row.published_at else None, 
+                        "score": row.overall_trust_score,      
+                        "status": row.trust_level,             
+                        "details": row.overall_summary,        
+                        "analyzed_at": row.analyzed_at.isoformat() if row.analyzed_at else None
+                    }
+    except Exception as e:
+        print(f"[{video_id}] Databricks DB 조회 에러: {e}")
+        
+    return None
+
+async def check_existing_report_in_db(video_id: str) -> dict | None:
+    """
+    FastAPI 이벤트 루프 블로킹 방지를 위한 비동기 스레드 실행
+    """
+    return await asyncio.to_thread(_sync_check_db, video_id)
 
 # ==========================================
 # 3. Databricks 연동 및 결과 시뮬레이션
@@ -110,10 +165,16 @@ async def stream_video_report(video_id: str, request: Request):
             yield {"event": "complete", "data": json.dumps(existing_report)}
         return EventSourceResponse(instant_response())
 
-    # 1. 락 획득 시도
-    lock_key = f"lock:video_process:{video_id}"
-    lock_acquired = await redis_client.set(lock_key, "processing", nx=True, ex=600)
-    
+    # Redis 연결 에러 추적을 위한 try-except 블록
+    try:
+        lock_key = f"lock:video_process:{video_id}"
+        lock_acquired = await redis_client.set(lock_key, "processing", nx=True, ex=600)
+    except Exception as e:
+        print(f"[{video_id}] ❌ Redis 연결 또는 락 획득 실패: {e}")
+        # 데드락 방지를 위해 에러 발생 시 스트림 종료
+        async def error_response():
+            yield {"event": "error", "data": json.dumps({"error": "Internal Redis Connection Error"})}
+        return EventSourceResponse(error_response())
     if lock_acquired:
         print(f"[{video_id}] 최초 요청 -> Databricks 파이프라인 호출 실행")
         

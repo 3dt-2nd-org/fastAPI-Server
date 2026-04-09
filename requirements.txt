@@ -1,0 +1,18 @@
+# Web Framework & Server
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+
+# Server-Sent Events (SSE)
+sse-starlette>=1.6.5
+
+# Redis (비동기 지원 포함)
+redis>=5.0.0
+
+# Environment Variables Management
+pydantic-settings>=2.0.0
+python-dotenv>=1.0.0
+
+# Databricks & Async HTTP Client
+databricks-sql-connector>=3.0.0
+databricks-sql-connector[pyarrow]
+httpx>=0.25.0
