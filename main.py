@@ -32,6 +32,13 @@ class Settings(BaseSettings):
 settings = Settings()
 app = FastAPI(title="Video Credibility Assessment API")
 
+app = FastAPI(
+    title="Video Credibility Assessment API",
+    docs_url=None, 
+    redoc_url=None, 
+    openapi_url=None
+)
+
 # ==========================================
 # 1-1. CORS 미들웨어 설정
 # ==========================================
@@ -159,10 +166,17 @@ async def stream_video_report(video_id: str, request: Request):
             yield {"event": "complete", "data": json.dumps(existing_report)}
         return EventSourceResponse(instant_response())
 
-    # 2. 역할 분배 (Leader / Follower)
+    # 2. [추가] 현재 파이프라인이 이미 실행 중인지 확인
+    is_processing = await redis_client.get(f"lock:video_process:{video_id}")
+    
     try:
-        lock_key = f"lock:subtitle_req:{video_id}"
-        is_leader = await redis_client.set(lock_key, "extracting", nx=True, ex=30)
+        if is_processing:
+            # 이미 처리 중이면 Leader 권한을 부여하지 않음
+            is_leader = False
+        else:
+            # 처리 중이 아닐 때만 자막 추출 권한(Leader) 획득 시도 (TTL 30초)
+            lock_key = f"lock:subtitle_req:{video_id}"
+            is_leader = await redis_client.set(lock_key, "extracting", nx=True, ex=30)
     except Exception as e:
         print(f"[{video_id}] ❌ Redis 연결 실패: {e}")
         async def error_response():
@@ -170,14 +184,18 @@ async def stream_video_report(video_id: str, request: Request):
         return EventSourceResponse(error_response())
 
     async def event_generator():
+        # 3. 역할에 따른 초기 이벤트 발송
         if is_leader:
             print(f"[{video_id}] 최초 접속자 식별. 자막 추출 명령(Leader) 하달.")
             yield {"event": "extract_command", "data": "upload_required"}
         else:
-            print(f"[{video_id}] 후속 접속자 식별. 대기 상태(Follower) 전환.")
-            yield {"event": "waiting", "data": "other_user_extracting"}
+            if is_processing:
+                print(f"[{video_id}] 파이프라인 실행 중 접속 식별. 대기 상태 전환.")
+            else:
+                print(f"[{video_id}] 후속 접속자 식별. 대기 상태(Follower) 전환.")
+            yield {"event": "waiting", "data": "pipeline_running_or_other_user_extracting"}
 
-        # 3. 통합 채널 구독
+        # 4. 통합 채널 구독
         pubsub = redis_client.pubsub()
         await pubsub.subscribe(f"channel:video_events:{video_id}")
 
