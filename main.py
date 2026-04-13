@@ -103,12 +103,22 @@ class WebhookPayload(BaseModel):
 # 2. Databricks DB 조회 로직 (Cache Hit)
 # ==========================================
 def _sync_check_db(video_id: str) -> dict | None:
-    table_path = f"{settings.databricks_catalog}.{settings.databricks_gold_schema}.video_analysis_summary"
-    query = f"""
+    summary_table = f"{settings.databricks_catalog}.{settings.databricks_gold_schema}.video_analysis_summary"
+    details_table = f"{settings.databricks_catalog}.{settings.databricks_gold_schema}.video_analysis_details"
+
+    # [쿼리 1] 요약 데이터 (존재 유무 판별 기준)
+    summary_query = f"""
         SELECT video_id, title, channel_name, published_at, overall_trust_score, 
                trust_level, overall_summary, analyzed_at 
-        FROM {table_path} WHERE video_id = :video_id LIMIT 1
+        FROM {summary_table} WHERE video_id = :video_id LIMIT 1
     """
+
+    # [쿼리 2] 상세 검증 데이터
+    details_query = f"""
+        SELECT claim_id, chunk_index, claim_text, verification_status, individual_score, reason, source_links
+        FROM {details_table} WHERE video_id = :video_id ORDER BY chunk_index
+    """
+
     try:
         with sql.connect(
             server_hostname=settings.databricks_server_hostname,
@@ -116,23 +126,58 @@ def _sync_check_db(video_id: str) -> dict | None:
             access_token=settings.databricks_token
         ) as connection:
             with connection.cursor() as cursor:
-                cursor.execute(query, {"video_id": video_id})
+                
+                # [순서 1] Summary 테이블 우선 조회
+                cursor.execute(summary_query, {"video_id": video_id})
                 row = cursor.fetchone()
                 
-                if row:
-                    print(f"[{video_id}] Databricks DB 캐시 히트: 요약 리포트 발견")
-                    return {
-                        "video_id": row.video_id,
-                        "title": row.title,
-                        "channel_name": row.channel_name,
-                        "published_at": row.published_at.isoformat() if row.published_at else None, 
-                        "score": row.overall_trust_score,      
-                        "status": row.trust_level,             
-                        "details": row.overall_summary,        
-                        "analyzed_at": row.analyzed_at.isoformat() if row.analyzed_at else None
-                    }
+                # 인과관계: summary 데이터가 없으면 아직 파이프라인 처리가 안 된 영상이므로
+                # 불필요한 details 조회를 생략하고 즉시 None을 반환하여 파이프라인 트리거 단계로 넘김
+                if not row:
+                    return None
+                    
+                # [순서 2] Summary 데이터가 존재할 때만 Details 테이블 조회
+                cursor.execute(details_query, {"video_id": video_id})
+                detail_rows = cursor.fetchall()
+                
+                claims_list = []
+                for d in detail_rows:
+                    # array 타입 방어 코드: Databricks Connector 설정에 따라 list로 오거나 JSON string으로 올 수 있음
+                    raw_links = d.source_links
+                    if isinstance(raw_links, str):
+                        try:
+                            parsed_links = json.loads(raw_links)
+                        except json.JSONDecodeError:
+                            parsed_links = []
+                    else:
+                        parsed_links = raw_links if raw_links else []
+
+                    claims_list.append({
+                        "claim_id": int(d.claim_id) if d.claim_id else None,
+                        "chunk_index": int(d.chunk_index) if d.chunk_index else None,
+                        "claim_text": d.claim_text,
+                        "verification_status": d.verification_status,
+                        "individual_score": float(d.individual_score) if d.individual_score else 0.0,
+                        "reason": d.reason,
+                        "source_links": parsed_links
+                    })
+                
+                print(f"[{video_id}] Databricks DB 캐시 히트: 요약 데이터 및 {len(claims_list)}개의 상세 주장 발견")
+                
+                # ReportData 스키마(프론트엔드 수신 규격)와 완벽히 일치하는 구조 반환
+                return {
+                    "score": float(row.overall_trust_score) if row.overall_trust_score else 0.0,      
+                    "status": row.trust_level,             
+                    "details": row.overall_summary,
+                    "title": row.title,
+                    "channel_name": row.channel_name,
+                    "published_at": row.published_at.isoformat() if row.published_at else "", 
+                    "analyzed_at": row.analyzed_at.isoformat() if row.analyzed_at else "",
+                    "claims": claims_list
+                }
     except Exception as e:
-        print(f"[{video_id}] Databricks DB 조회 에러: {e}")
+        print(f"[{video_id}] Databricks DB 캐시 조회 에러: {e}")
+        
     return None
 
 async def check_existing_report_in_db(video_id: str) -> dict | None:
