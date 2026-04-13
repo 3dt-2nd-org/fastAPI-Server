@@ -55,7 +55,7 @@ redis_client = redis.Redis(
     port=settings.redis_port,
     db=settings.redis_db,
     password=settings.redis_password,
-    # ssl=True,  # Redis 서버가 SSL을 지원하는 경우 True로 설정
+    ssl=True,  # Redis 서버가 SSL을 지원하는 경우 True로 설정
     decode_responses=True
 )
 
@@ -144,13 +144,17 @@ def _sync_check_db(video_id: str) -> dict | None:
                 for d in detail_rows:
                     # array 타입 방어 코드: Databricks Connector 설정에 따라 list로 오거나 JSON string으로 올 수 있음
                     raw_links = d.source_links
-                    if isinstance(raw_links, str):
+                    
+                    if raw_links is None:
+                        parsed_links = []
+                    elif isinstance(raw_links, str):
                         try:
                             parsed_links = json.loads(raw_links)
                         except json.JSONDecodeError:
                             parsed_links = []
                     else:
-                        parsed_links = raw_links if raw_links else []
+                        # PyArrow/Numpy 배열 객체일 경우 Python 기본 List로 강제 형변환
+                        parsed_links = list(raw_links)
 
                     claims_list.append({
                         "claim_id": int(d.claim_id) if d.claim_id else None,
@@ -201,17 +205,17 @@ async def trigger_databricks_pipeline(video_id: str, payload_data: dict):
             print(f"[{video_id}] Volume 업로드 완료: {volume_path}")
             
             # 2. Job 트리거 (DAG ID: 732808891257274)
-            # job_run_url = f"{databricks_url}/api/2.1/jobs/run-now"
-            # job_payload = {
-            #     "job_id": 732808891257274,
-            #     "notebook_params": {
-            #         "video_id": video_id
-            #     }
-            # }
-            # trigger_res = await client.post(job_run_url, headers=headers, json=job_payload)
-            # trigger_res.raise_for_status()
-            # print(f"[{video_id}] 파이프라인 실행 요청 성공: Run ID {trigger_res.json().get('run_id')}")
-            print(f"[{video_id}] Databricks 파이프라인 트리거 명령 시뮬레이션 완료 (실제 트리거 로직은 주석 처리됨)")
+            job_run_url = f"{databricks_url}/api/2.1/jobs/run-now"
+            job_payload = {
+                "job_id": 732808891257274,
+                "notebook_params": {
+                    "video_id": video_id
+                }
+            }
+            trigger_res = await client.post(job_run_url, headers=headers, json=job_payload)
+            trigger_res.raise_for_status()
+            print(f"[{video_id}] 파이프라인 실행 요청 성공: Run ID {trigger_res.json().get('run_id')}")
+            # print(f"[{video_id}] Databricks 파이프라인 트리거 명령 시뮬레이션 완료 (실제 트리거 로직은 주석 처리됨)")
             
         except Exception as e:
             print(f"[{video_id}] Databricks 연동 실패: {e}")
