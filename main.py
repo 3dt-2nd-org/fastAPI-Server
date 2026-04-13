@@ -1,12 +1,12 @@
 import asyncio
 import json
 import redis.asyncio as redis
-import os
 import httpx
 
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
+from typing import List, Optional
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from databricks import sql
@@ -75,10 +75,29 @@ class SubtitlePayload(BaseModel):
     metadata: VideoMetadata
     subtitle_data: dict
 
+class ClaimDetail(BaseModel):
+    claim_id: int
+    chunk_index: int
+    claim_text: str
+    verification_status: str
+    individual_score: float
+    reason: str
+    source_links: List[str]
+
+class ReportData(BaseModel):
+    score: float
+    status: str
+    details: str
+    title: str
+    channel_name: str
+    published_at: str
+    analyzed_at: str
+    claims: List[ClaimDetail]
+
 class WebhookPayload(BaseModel):
     video_id: str
-    event_type: str  # "score_update", "complete", "error" 등
-    data: dict
+    event_type: str
+    data: ReportData
 
 # ==========================================
 # 2. Databricks DB 조회 로직 (Cache Hit)
@@ -238,13 +257,14 @@ async def receive_subtitles(video_id: str, payload: SubtitlePayload, background_
 
     print(f"[{video_id}] Leader로부터 자막 수신 완료.")
     
-    # 파일 저장 로직 (디버깅용)
+    payload_dict = payload.model_dump()
+
+    # json 파일 저장 로직 (디버깅용)
     # #---------------------------------------#
     # save_dir = "debug_subtitles"
     # os.makedirs(save_dir, exist_ok=True)
     # file_path = os.path.join(save_dir, f"{video_id}.json")
     
-    payload_dict = payload.model_dump()
     # with open(file_path, "w", encoding="utf-8") as f:
     #     json.dump(payload_dict, f, ensure_ascii=False, indent=4)
         
@@ -268,18 +288,29 @@ async def receive_subtitles(video_id: str, payload: SubtitlePayload, background_
 # ==========================================
 @app.post("/api/webhook/databricks")
 async def databricks_webhook(payload: WebhookPayload):
+    """
+    [인과관계 분석]
+    1. Pydantic이 수신된 JSON을 ReportData 스키마에 맞춰 엄격히 검증함. (필드 누락, 타입 오류 사전 차단)
+    2. 검증된 데이터를 다시 JSON으로 직렬화하여 Redis 채널에 발행함.
+    3. 'complete' 이벤트이므로 파이프라인 프로세스 락을 즉시 해제함.
+    """
+    # 클라이언트(익스텐션)에 전달할 최종 이벤트 패킷
     event_msg = {
         "event": payload.event_type,
-        "data": json.dumps(payload.data)
+        # model_dump()를 통해 검증된 Pydantic 객체를 다시 dict로 변환 후 문자열 직렬화
+        "data": json.dumps(payload.data.model_dump(), ensure_ascii=False)
     }
     
-    # 1차(점수), 2차(완료), 에러 등 모든 이벤트를 클라이언트에 실시간 브로드캐스트
-    await redis_client.publish(f"channel:video_events:{payload.video_id}", json.dumps(event_msg))
+    # SSE 채널 브로드캐스트
+    await redis_client.publish(
+        f"channel:video_events:{payload.video_id}", 
+        json.dumps(event_msg, ensure_ascii=False)
+    )
     
-    # 완전히 종료되었을 때만 프로세스 락 해제
-    if payload.event_type in ["complete", "error"]:
+    # 프로세스 락 및 추출 권한 락 해제
+    if payload.event_type in ["complete", "failed"]:
         await redis_client.delete(f"lock:video_process:{payload.video_id}")
         await redis_client.delete(f"lock:subtitle_req:{payload.video_id}")
-        print(f"[{payload.video_id}] 락 해제 및 파이프라인 프로세스 종료 처리 완료.")
+        print(f"[{payload.video_id}] 락 해제 완료. (상태: {payload.event_type})")
 
     return {"status": "success", "event_type": payload.event_type}
